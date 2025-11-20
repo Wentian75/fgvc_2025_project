@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+
+# Environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# IDE/editor
+.vscode/
+.idea/
+.DS_Store
+
+# Data and artifacts
+data/
+outputs/
+wandb/
+cache/
+logs/
+
+# Checkpoints and large files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.npy
+
+# Submissions (optional: uncomment to ignore)
+# submission.csv
+# submissions/
+

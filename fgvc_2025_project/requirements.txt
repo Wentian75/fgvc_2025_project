@@ -1,0 +1,11 @@
+torch
+torchvision
+timm
+wandb
+scikit-learn
+numpy
+pillow
+fathomnet>=0.0.10; python_version>='3.9'
+requests
+rich
+pyyaml
