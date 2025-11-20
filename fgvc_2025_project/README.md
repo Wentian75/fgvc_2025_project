@@ -30,6 +30,8 @@ Quick Start
      - `python -m src.infer --data-root data/test --model-dir outputs/checkpoints --output submission.csv`
    - The output CSV has headers `annotation_id,concept_name` and can be submitted to Kaggle.
 
+See also: USAGE.md for a step-by-step training/validation/submission guide.
+
 WandB Logging
 - Primary metric: `val/mean_hierarchical_distance` (MHD). Decreasing MHD indicates better taxonomic awareness.
 - Grouped confusion (by Phylum) if taxonomy is resolved; otherwise logs class-level.
@@ -76,3 +78,10 @@ Hierarchical Training + Inference
   - Enable with `src.infer --hierarchical --enable-taxonomy`.
   - Thresholds per rank via `--rank-thresholds`, default `species:0.55,genus:0.60,family:0.65,order:0.70,class:0.75,phylum:0.80,kingdom:0.85`.
   - If species top-1 prob < threshold, it backs off progressively to higher ranks and outputs the ancestor name.
+
+Config via YAML
+- Edit `configs/default.yaml` and run with:
+  - Train: `python -m src.train --config configs/default.yaml`
+  - Eval: `python -m src.eval --config configs/default.yaml --model-dir outputs/checkpoints --data-root data/train`
+  - Infer: `python -m src.infer --config configs/default.yaml --model-dir outputs/checkpoints --data-root data/test --output submission.csv`
+- YAML keys cover: epochs, lr, lr_schedule (cosine), loss weights (CE vs HD), LoRA toggles/params, AMP dtype/compile, and hierarchical thresholds for inference.

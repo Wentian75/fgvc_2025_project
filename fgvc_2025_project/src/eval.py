@@ -21,7 +21,7 @@ from .taxonomy_wandb_utils import (
     log_grouped_confusion,
     build_error_table,
 )
-from .utils import load_labels, label2idx_from_idx2label, load_checkpoint, get_device
+from .utils import load_labels, label2idx_from_idx2label, load_checkpoint, get_device, update_args_from_yaml
 
 
 def run_eval(args):
@@ -121,9 +121,12 @@ def parse_args():
     p.add_argument("--backbone", type=str, default="vit_base_patch16_224")
     p.add_argument("--error-table-min-hd", type=int, default=6)
     p.add_argument("--error-table-max", type=int, default=200)
+    p.add_argument("--config", type=str, default=None)
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.config:
+        args = update_args_from_yaml(args, Path(args.config))
     run_eval(args)

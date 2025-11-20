@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from .datasets import make_loader_for_infer, read_annotations_csv
 from .model import build_model
-from .utils import load_labels, label2idx_from_idx2label, load_checkpoint, get_device
+from .utils import load_labels, label2idx_from_idx2label, load_checkpoint, get_device, update_args_from_yaml
 from .taxonomy_wandb_utils import init_taxonomy, build_rank_groups_for_labels, RANKS
 
 
@@ -128,6 +128,7 @@ def parse_args():
     ap.add_argument("--hierarchical", action="store_true", help="Enable hierarchical backoff prediction by rank thresholds")
     ap.add_argument("--rank-thresholds", type=str, default="species:0.55,genus:0.60,family:0.65,order:0.70,class:0.75,phylum:0.80,kingdom:0.85",
                     help="Comma-separated rank:threshold list")
+    ap.add_argument("--config", type=str, default=None, help="Path to YAML to override args")
     return ap.parse_args()
 
 
@@ -148,4 +149,34 @@ def parse_rank_thresholds(spec: str) -> Dict[str, float]:
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.config:
+        args = update_args_from_yaml(args, Path(args.config))
+    # Allow loading backbone/lora settings from model_config.json if present
+    model_dir = Path(args.model_dir)
+    cfg_path = model_dir / "model_config.json"
+    if cfg_path.exists():
+        try:
+            from .utils import load_model_config
+            mcfg = load_model_config(cfg_path)
+            args.backbone = mcfg.get("backbone", args.backbone)
+            # Rebuild model with correct LoRA configuration if used in training
+            args_lora = {
+                "use_lora": mcfg.get("use_lora", False),
+                "lora_r": mcfg.get("lora_r", 8),
+                "lora_alpha": mcfg.get("lora_alpha", 16.0),
+                "lora_dropout": mcfg.get("lora_dropout", 0.0),
+            }
+        except Exception:
+            args_lora = {"use_lora": False, "lora_r": 8, "lora_alpha": 16.0, "lora_dropout": 0.0}
+    else:
+        args_lora = {"use_lora": False, "lora_r": 8, "lora_alpha": 16.0, "lora_dropout": 0.0}
+    # Monkey patch build_model kwargs via global variable
+    _orig_build_model = build_model
+    def _build_model(num_classes, backbone, pretrained=False):
+        return _orig_build_model(num_classes=num_classes, backbone=backbone, pretrained=pretrained,
+                                 use_lora=args_lora.get("use_lora", False),
+                                 lora_r=args_lora.get("lora_r", 8),
+                                 lora_alpha=args_lora.get("lora_alpha", 16.0),
+                                 lora_dropout=args_lora.get("lora_dropout", 0.0))
+    globals()["build_model"] = _build_model
     run_infer(args)

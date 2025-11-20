@@ -1,0 +1,38 @@
+# General training config
+project: fgvc2025
+run_name: vitb16_baseline
+
+# Data
+data_root: data/train
+val_split: 0.1
+image_size: 224
+batch_size: 128
+num_workers: 8
+seed: 42
+
+# Model
+backbone: vit_base_patch16_224
+use_lora: false
+lora_r: 8
+lora_alpha: 16.0
+lora_dropout: 0.0
+
+# Optimization
+epochs: 50
+lr: 5.0e-4
+weight_decay: 0.05
+lr_schedule: cosine
+min_lr: 1.0e-6
+amp_dtype: bfloat16
+compile: true
+
+# Loss weights
+ce_loss_weight: 1.0
+hd_loss_weight: 1.0
+enable_taxonomy: true
+cache_dir: cache
+
+# Inference (hierarchical backoff)
+hierarchical: true
+rank_thresholds: "species:0.55,genus:0.60,family:0.65,order:0.70,class:0.75,phylum:0.80,kingdom:0.85"
+

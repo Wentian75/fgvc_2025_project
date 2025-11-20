@@ -27,7 +27,7 @@ from .taxonomy_wandb_utils import (
     log_lora_grads,
     align_distance_matrix_for_labels,
 )
-from .utils import save_checkpoint, save_labels, get_device
+from .utils import save_checkpoint, save_labels, get_device, save_model_config, update_args_from_yaml
 
 
 def accuracy(preds: np.ndarray, labels: np.ndarray) -> float:
@@ -52,6 +52,10 @@ def run_train(args):
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
+        "ce_loss_weight": args.ce_loss_weight,
+        "hd_loss_weight": args.hd_loss_weight,
+        "lr_schedule": args.lr_schedule,
+        "min_lr": args.min_lr,
     })
     define_wandb_metrics()
 
@@ -97,6 +101,12 @@ def run_train(args):
     if dist_mat_torch is not None:
         dist_mat_torch = dist_mat_torch.to(device, non_blocking=True)
 
+    # LR scheduler
+    scheduler = None
+    if args.lr_schedule == "cosine":
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr)
+
     # AMP setup (A100-friendly)
     use_amp = device.type == "cuda" and args.amp_dtype.lower() != "none"
     amp_dtype = None
@@ -112,15 +122,31 @@ def run_train(args):
     ckpt_dir = Path(args.out_dir) / "checkpoints"
     labels_path = ckpt_dir / "labels.json"
     best_ckpt_path = ckpt_dir / "best.pt"
+    model_cfg_path = ckpt_dir / "model_config.json"
 
     # Persist labels mapping for inference
     save_labels(idx2label, labels_path)
+
+    # Persist model configuration for consistent inference
+    save_model_config({
+        "backbone": args.backbone,
+        "use_lora": args.use_lora,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "num_classes": len(idx2label),
+    }, model_cfg_path)
 
     global_step = 0
     best_val = -1.0
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_losses: List[float] = []
+        train_ce_vals: List[float] = []
+        train_hd_vals: List[float] = []
+        train_entropy_vals: List[float] = []
+        val_hd_vals: List[float] = []
+        val_entropy_vals: List[float] = []
         correct = 0
         total = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", ncols=100)
@@ -139,8 +165,12 @@ def run_train(args):
                         probs = F.softmax(logits, dim=-1).float()
                         row = D_dev[yb]  # [B, C]
                         hd = (probs * row).sum(dim=-1).mean()
+                        # entropy
+                        entropy = (-probs * (probs.clamp_min(1e-9).log())).sum(dim=-1).mean()
                         loss = args.ce_loss_weight * ce + args.hd_loss_weight * hd
                     else:
+                        probs = F.softmax(logits, dim=-1)
+                        entropy = (-probs * (probs.clamp_min(1e-9).log())).sum(dim=-1).mean()
                         loss = ce
                 if scaler and scaler.is_enabled():
                     # Unscale for consistent grad norm logging
@@ -163,8 +193,11 @@ def run_train(args):
                     probs = F.softmax(logits, dim=-1).float()
                     row = D_dev[yb]
                     hd = (probs * row).sum(dim=-1).mean()
+                    entropy = (-probs * (probs.clamp_min(1e-9).log())).sum(dim=-1).mean()
                     loss = args.ce_loss_weight * ce + args.hd_loss_weight * hd
                 else:
+                    probs = F.softmax(logits, dim=-1)
+                    entropy = (-probs * (probs.clamp_min(1e-9).log())).sum(dim=-1).mean()
                     loss = ce
                 loss.backward()
                 if args.use_lora:
@@ -172,16 +205,29 @@ def run_train(args):
                 optimizer.step()
 
             train_losses.append(loss.item())
+            train_ce_vals.append(float(ce.item()))
+            train_hd_vals.append(float(hd.item() if dist_mat_torch is not None and args.hd_loss_weight > 0 else 0.0))
+            train_entropy_vals.append(float(entropy.item()))
             pred = logits.argmax(dim=1)
             correct += (pred == yb).sum().item()
             total += yb.numel()
             acc = correct / max(total, 1)
             pbar.set_postfix({"loss": f"{loss.item():.3f}", "acc": f"{acc:.3f}"})
             if global_step % 50 == 0:
-                wandb.log({"train/loss": loss.item(), "train/acc": acc, "epoch": epoch})
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/acc": acc,
+                    "train/ce": float(ce.item()),
+                    "train/hd_expected": float(hd.item() if dist_mat_torch is not None and args.hd_loss_weight > 0 else 0.0),
+                    "train/entropy": float(entropy.item()),
+                    "epoch": epoch
+                })
             global_step += 1
 
         train_loss = float(np.mean(train_losses)) if train_losses else 0.0
+        train_ce = float(np.mean(train_ce_vals)) if train_ce_vals else 0.0
+        train_hd = float(np.mean(train_hd_vals)) if train_hd_vals else 0.0
+        train_entropy = float(np.mean(train_entropy_vals)) if train_entropy_vals else 0.0
         train_acc = correct / max(total, 1)
 
         # Validation
@@ -202,6 +248,13 @@ def run_train(args):
                 else:
                     logits = model(xb)
                 probs = F.softmax(logits, dim=-1)
+                # Expected HD and Entropy on val
+                if dist_mat_torch is not None and args.hd_loss_weight > 0:
+                    row = dist_mat_torch[yb]
+                    hd_val = (probs * row).sum(dim=-1).mean().item()
+                    val_hd_vals.append(hd_val)
+                entropy_val = (-probs * (probs.clamp_min(1e-9).log())).sum(dim=-1).mean().item()
+                val_entropy_vals.append(entropy_val)
                 preds = probs.argmax(dim=1)
                 val_correct += (preds == yb).sum().item()
                 val_total += yb.numel()
@@ -231,12 +284,28 @@ def run_train(args):
             "train/loss": train_loss,
             "train/acc": train_acc,
             "val/acc": val_acc,
+            "train/ce": train_ce,
+            "train/hd_expected": train_hd,
+            "train/entropy": train_entropy,
         }
         if mhd is not None and mhd == mhd:  # check for NaN
             log_data["val/mean_hierarchical_distance"] = float(mhd)
+        # Log val expected HD/entropy (averaged in loop above via appends)
+        if dist_mat_torch is not None and args.hd_loss_weight > 0:
+            log_data["val/hd_expected"] = float(np.mean(val_hd_vals)) if val_hd_vals else 0.0
+        log_data["val/entropy"] = float(np.mean(val_entropy_vals)) if val_entropy_vals else 0.0
         # Optional: log separate heads
         # Note: train CE/HD components were combined; expose combined only to keep UI tidy
         wandb.log(log_data)
+
+        # Step LR scheduler per epoch
+        if scheduler is not None:
+            scheduler.step()
+        # Log LR
+        try:
+            wandb.log({"lr": optimizer.param_groups[0]["lr"]}, commit=False)
+        except Exception:
+            pass
 
         # Grouped confusion
         try:
@@ -276,7 +345,9 @@ def run_train(args):
                 best_val = val_acc
                 save_best = True
         if save_best:
-            save_checkpoint(model, best_ckpt_path)
+            # Save in a forward-compatible wrapper
+            best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"state_dict": model.state_dict()}, best_ckpt_path)
 
 
 def parse_args():
@@ -306,9 +377,14 @@ def parse_args():
     p.add_argument("--compile", action="store_true", help="Use torch.compile on CUDA for potential speedups")
     p.add_argument("--ce-loss-weight", type=float, default=1.0, help="Weight for cross-entropy loss")
     p.add_argument("--hd-loss-weight", type=float, default=1.0, help="Weight for expected hierarchical distance loss")
+    p.add_argument("--lr-schedule", type=str, default="cosine", choices=["none", "cosine"], help="Learning rate schedule")
+    p.add_argument("--min-lr", type=float, default=1e-6, help="Minimum LR for cosine schedule")
+    p.add_argument("--config", type=str, default=None, help="Path to YAML config to override args")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.config:
+        args = update_args_from_yaml(args, Path(args.config))
     run_train(args)

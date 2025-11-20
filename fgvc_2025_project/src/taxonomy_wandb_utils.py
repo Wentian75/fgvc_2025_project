@@ -94,14 +94,23 @@ def _normalize_rank_key(rank: str) -> Optional[str]:
     r = rank.strip().lower()
     # normalize synonyms/variants
     mapping = {
-        "subphylum": "phylum",
+        # canonical
+        "kingdom": "kingdom",
         "phylum": "phylum",
         "class": "class",
         "order": "order",
         "family": "family",
         "genus": "genus",
         "species": "species",
-        "kingdom": "kingdom",
+        # map variants to canonical without overriding canonical values
+        "subkingdom": "kingdom", "superkingdom": "kingdom",
+        "subphylum": "phylum", "infraphylum": "phylum", "superphylum": "phylum",
+        "subclass": "class", "infraclass": "class", "superclass": "class",
+        "suborder": "order", "infraorder": "order", "superorder": "order",
+        "subfamily": "family", "superfamily": "family",
+        "subgenus": "genus", "section": "genus",
+        # common non-canonical nodes we ignore or map conservatively
+        "division": "phylum",  # sometimes used in botany
     }
     return mapping.get(r, None)
 
@@ -113,10 +122,13 @@ def _extract_path_from_worms_classification(tree: dict) -> List[Optional[str]]:
     node = tree
     visited = 0
     while isinstance(node, dict) and visited < 128:
-        rank = _normalize_rank_key(node.get("rank") or node.get("Rank"))
+        rank_raw = node.get("rank") or node.get("Rank")
+        rank = _normalize_rank_key(rank_raw)
         name = node.get("scientificname") or node.get("ScientificName") or node.get("name")
         if rank in values and name:
-            values[rank] = name
+            # Only fill if not already set by a canonical level to avoid overriding
+            if values[rank] is None:
+                values[rank] = name
         node = node.get("child") or node.get("Child") or None
         visited += 1
     return [values[r] for r in RANKS]
