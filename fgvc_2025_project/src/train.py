@@ -40,7 +40,8 @@ def run_train(args):
     assert csv_path.exists(), f"{csv_path} not found. Run the official downloader first."
 
     project = args.project or "fgvc2025"
-    run = wandb.init(project=project, name=args.run_name, config={
+    # Ensure a fresh run each time; do not resume or compare with past run IDs
+    run = wandb.init(project=project, name=args.run_name, resume="never", reinit=True, config={
         "backbone": args.backbone,
         "image_size": args.image_size,
         "batch_size": args.batch_size,
@@ -139,6 +140,8 @@ def run_train(args):
 
     global_step = 0
     best_val = -1.0
+    no_improve = 0
+    use_mhd_for_selection = False
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_losses: List[float] = []
@@ -331,23 +334,43 @@ def run_train(args):
         except Exception as e:
             print(f"[val] error table skipped: {e}")
 
-        # Save best: prefer lowest MHD if available, else highest accuracy
+        # Save best and early stop: prefer lowest MHD if available, else highest accuracy
         save_best = False
+        improved = False
+        metric_name = "val/acc"
+        current_metric = val_acc
         if mhd is not None and mhd == mhd:
+            metric_name = "val/mean_hierarchical_distance"
+            current_metric = mhd
+            use_mhd_for_selection = True
             if not hasattr(run_train, "_best_mhd"):
                 run_train._best_mhd = mhd
                 save_best = True
-            elif mhd < run_train._best_mhd:
+                improved = True
+            elif (run_train._best_mhd - mhd) > args.early_delta:
                 run_train._best_mhd = mhd
                 save_best = True
+                improved = True
         else:
-            if val_acc > best_val:
+            if (val_acc - best_val) > args.early_delta:
                 best_val = val_acc
                 save_best = True
+                improved = True
         if save_best:
             # Save in a forward-compatible wrapper
             best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"state_dict": model.state_dict()}, best_ckpt_path)
+
+        # Early stopping check
+        if args.early_stop:
+            no_improve = 0 if improved else (no_improve + 1)
+            try:
+                wandb.log({"early_stop/no_improve_epochs": no_improve, "early_stop/metric": current_metric, "early_stop/metric_name": metric_name}, commit=False)
+            except Exception:
+                pass
+            if no_improve >= args.early_patience:
+                print(f"Early stopping: no improvement in {metric_name} for {no_improve} epochs.")
+                break
 
 
 def parse_args():
@@ -380,6 +403,10 @@ def parse_args():
     p.add_argument("--lr-schedule", type=str, default="cosine", choices=["none", "cosine"], help="Learning rate schedule")
     p.add_argument("--min-lr", type=float, default=1e-6, help="Minimum LR for cosine schedule")
     p.add_argument("--config", type=str, default=None, help="Path to YAML config to override args")
+    # Early stopping
+    p.add_argument("--early-stop", action="store_true", help="Enable early stopping on val metric (MHD if available else accuracy)")
+    p.add_argument("--early-patience", type=int, default=5, help="Epochs with no improvement before stopping")
+    p.add_argument("--early-delta", type=float, default=0.0, help="Minimum change to qualify as improvement")
     return p.parse_args()
 
 

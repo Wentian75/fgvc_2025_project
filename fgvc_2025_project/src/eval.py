@@ -39,7 +39,7 @@ def run_eval(args):
     assert idx2label_check == idx2label
 
     if args.project:
-        run = wandb.init(project=args.project, name=args.run_name)
+        run = wandb.init(project=args.project, name=args.run_name, resume="never", reinit=True)
         define_wandb_metrics()
     else:
         run = None
@@ -47,7 +47,24 @@ def run_eval(args):
     tax = init_taxonomy(idx2label, cache_dir=Path(args.cache_dir)) if args.enable_taxonomy else None
 
     device = get_device()
-    model = build_model(num_classes=len(idx2label), backbone=args.backbone, pretrained=False)
+    # Respect model_config.json if present (e.g., LoRA settings/backbone)
+    mcfg_path = Path(args.model_dir) / "model_config.json"
+    if mcfg_path.exists():
+        try:
+            from .utils import load_model_config
+            mcfg = load_model_config(mcfg_path)
+            args.backbone = mcfg.get("backbone", args.backbone)
+            use_lora = mcfg.get("use_lora", False)
+            lora_r = mcfg.get("lora_r", 8)
+            lora_alpha = mcfg.get("lora_alpha", 16.0)
+            lora_dropout = mcfg.get("lora_dropout", 0.0)
+        except Exception:
+            use_lora, lora_r, lora_alpha, lora_dropout = False, 8, 16.0, 0.0
+    else:
+        use_lora, lora_r, lora_alpha, lora_dropout = False, 8, 16.0, 0.0
+
+    model = build_model(num_classes=len(idx2label), backbone=args.backbone, pretrained=False,
+                        use_lora=use_lora, lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
     load_checkpoint(model, ckpt_path, map_location=device)
     model.to(device).eval()
 

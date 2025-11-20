@@ -94,7 +94,7 @@ def _normalize_rank_key(rank: str) -> Optional[str]:
     r = rank.strip().lower()
     # normalize synonyms/variants
     mapping = {
-        # canonical
+        # canonical only (prefer exact canonical ranks; avoid mapping sub/super ranks to prevent mislabels like 'Vertebrata')
         "kingdom": "kingdom",
         "phylum": "phylum",
         "class": "class",
@@ -102,15 +102,9 @@ def _normalize_rank_key(rank: str) -> Optional[str]:
         "family": "family",
         "genus": "genus",
         "species": "species",
-        # map variants to canonical without overriding canonical values
-        "subkingdom": "kingdom", "superkingdom": "kingdom",
-        "subphylum": "phylum", "infraphylum": "phylum", "superphylum": "phylum",
-        "subclass": "class", "infraclass": "class", "superclass": "class",
-        "suborder": "order", "infraorder": "order", "superorder": "order",
-        "subfamily": "family", "superfamily": "family",
-        "subgenus": "genus", "section": "genus",
-        # common non-canonical nodes we ignore or map conservatively
-        "division": "phylum",  # sometimes used in botany
+        # conservative mappings
+        "division": "phylum",  # sometimes used in botany; treat as phylum
+        # NOTE: do NOT map sub/super ranks to canonical to avoid overwriting true canonical ranks
     }
     return mapping.get(r, None)
 
