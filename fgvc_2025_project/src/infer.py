@@ -28,6 +28,37 @@ def parse_annotation_id_from_roi_path(path: str) -> str:
     return m.group(2)
 
 
+def _load_submission_ids(path: str) -> List[str]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"submission list not found: {p}")
+    ext = p.suffix.lower()
+    ids: List[str] = []
+    if ext == ".json":
+        # Expect COCO-like dataset_test.json with `annotations` list and `id` field
+        import json
+        data = json.loads(p.read_text())
+        anns = data.get("annotations", [])
+        ids = [str(a.get("id")) for a in anns if "id" in a]
+    elif ext == ".csv":
+        import csv as _csv
+        with open(p, "r") as f:
+            reader = _csv.DictReader(f)
+            # Prefer column named 'annotation_id'; else try first column
+            field = "annotation_id" if reader.fieldnames and "annotation_id" in reader.fieldnames else (reader.fieldnames[0] if reader.fieldnames else None)
+            if field is None:
+                raise ValueError("CSV must have a header with annotation_id column")
+            for r in reader:
+                if r.get(field):
+                    ids.append(str(r[field]).strip())
+    else:
+        # Assume txt: one id per line
+        ids = [line.strip() for line in p.read_text().splitlines() if line.strip()]
+    if not ids:
+        raise ValueError(f"No annotation ids found in {p}")
+    return ids
+
+
 def run_infer(args):
     data_root = Path(args.data_root)
     csv_path = data_root / "annotations.csv"
@@ -51,7 +82,7 @@ def run_infer(args):
     rows = read_annotations_csv(csv_path)
     roi_paths = [r.path for r in rows]
 
-    # Optional taxonomy init for hierarchical backoff
+    # Optional taxonomy init for hierarchical backoff (safe: does not require wandb)
     tax = init_taxonomy(idx2label, cache_dir=Path(args.cache_dir)) if args.enable_taxonomy or args.hierarchical else None
     rank_groups: Dict[str, Dict[str, List[int]]] = {}
     if tax is not None:
@@ -60,59 +91,79 @@ def run_infer(args):
 
     thresholds = parse_rank_thresholds(args.rank_thresholds)
 
-    preds_names: List[str] = []
+    # For de-duplication and exact 1-row-per-annotation: track best prediction per annotation_id
+    preds_names: List[str] = []  # legacy list (will be superseded by map)
+    best_for_ann: Dict[str, Dict[str, object]] = {}  # ann_id -> {name:str, conf:float}
     with torch.no_grad():
         idx = 0
         for xb, yb, paths, names in tqdm(loader, desc="infer", ncols=100):
             xb = xb.to(device, non_blocking=True)
             logits = model(xb)
             probs = F.softmax(logits, dim=-1)
-            if not args.hierarchical or tax is None:
-                pred = probs.argmax(dim=1).cpu().tolist()
-                for p in pred:
-                    preds_names.append(idx2label[p])
-            else:
-                for i in range(probs.size(0)):
-                    pvec = probs[i].cpu()
+            for i in range(probs.size(0)):
+                pvec = probs[i].cpu()
+                ann = parse_annotation_id_from_roi_path(paths[i])
+                if not args.hierarchical or tax is None:
+                    s_idx = int(torch.argmax(pvec))
+                    s_prob = float(pvec[s_idx])
+                    cname = idx2label[s_idx]
+                    conf = s_prob
+                else:
                     # Species (leaf)
                     s_idx = int(torch.argmax(pvec))
                     s_prob = float(pvec[s_idx])
                     if s_prob >= thresholds.get("species", 0.55):
-                        preds_names.append(idx2label[s_idx])
-                        continue
-                    chosen: Optional[str] = None
-                    # Backoff sequence
-                    for r in ["genus", "family", "order", "class", "phylum", "kingdom"]:
-                        groups = rank_groups.get(r, {})
-                        if not groups:
-                            continue
-                        thr = thresholds.get(r, 0.6)
-                        best_name = None
-                        best_prob = -1.0
-                        for gname, idxs in groups.items():
-                            if not idxs:
+                        cname = idx2label[s_idx]
+                        conf = s_prob
+                    else:
+                        chosen: Optional[str] = None
+                        conf = s_prob
+                        # Backoff sequence
+                        for r in ["genus", "family", "order", "class", "phylum", "kingdom"]:
+                            groups = rank_groups.get(r, {})
+                            if not groups:
                                 continue
-                            prob = float(pvec[idxs].sum().item())
-                            if prob > best_prob:
-                                best_prob = prob
-                                best_name = gname
-                        if best_name is not None and best_prob >= thr:
-                            chosen = best_name
-                            break
-                    preds_names.append(chosen if chosen is not None else idx2label[s_idx])
+                            thr = thresholds.get(r, 0.6)
+                            best_name = None
+                            best_prob = -1.0
+                            for gname, idxs in groups.items():
+                                if not idxs:
+                                    continue
+                                prob = float(pvec[idxs].sum().item())
+                                if prob > best_prob:
+                                    best_prob = prob
+                                    best_name = gname
+                            if best_name is not None and best_prob >= thr:
+                                chosen = best_name
+                                conf = best_prob
+                                break
+                        cname = chosen if chosen is not None else idx2label[s_idx]
+                prev = best_for_ann.get(ann)
+                if (prev is None) or (conf > float(prev.get("conf", -1.0))):
+                    best_for_ann[ann] = {"name": cname, "conf": conf}
             idx += logits.size(0)
 
-    # Build annotation ids and deduplicate to ensure one row per annotation_id
-    ann_ids = [parse_annotation_id_from_roi_path(rp) for rp in roi_paths]
-    unique_rows = []
-    seen = set()
-    for ann, cname in zip(ann_ids, preds_names):
-        if ann in seen:
-            continue
-        seen.add(ann)
-        unique_rows.append((ann, cname))
+    # Optionally restrict to a provided submission ID list (e.g., dataset_test.json or sample_submission.csv)
+    if args.submission_list:
+        sub_ids = _load_submission_ids(args.submission_list)
+        unique_rows = []
+        missing = 0
+        for ann in sub_ids:
+            rec = best_for_ann.get(str(ann))
+            if rec is None:
+                missing += 1
+                # Fallback to a valid high-rank taxon; competition allows any rank
+                cname = "Animalia"
+            else:
+                cname = rec["name"]
+            unique_rows.append((str(ann), cname))
+        if missing:
+            print(f"[infer] Warning: {missing} annotation_ids not found in predictions; filled with 'Animalia'.")
+    else:
+        # Build from whatever was predicted: one row per unique annotation_id
+        unique_rows = sorted([(ann, v["name"]) for ann, v in best_for_ann.items()], key=lambda x: x[0])
 
-    # write submission (unique annotation_ids only)
+    # write submission
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="") as f:
@@ -137,6 +188,8 @@ def parse_args():
     ap.add_argument("--hierarchical", action="store_true", help="Enable hierarchical backoff prediction by rank thresholds")
     ap.add_argument("--rank-thresholds", type=str, default="species:0.55,genus:0.60,family:0.65,order:0.70,class:0.75,phylum:0.80,kingdom:0.85",
                     help="Comma-separated rank:threshold list")
+    ap.add_argument("--submission-list", type=str, default=None,
+                    help="Optional path to a list of annotation_ids (CSV with header annotation_id, JSON dataset_test.json, or TXT one id per line). If provided, output rows will match this list and count exactly.")
     ap.add_argument("--config", type=str, default=None, help="Path to YAML to override args")
     return ap.parse_args()
 

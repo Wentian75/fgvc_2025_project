@@ -192,7 +192,12 @@ def init_taxonomy(concepts: List[str], cache_dir: Path) -> Optional[Taxonomy]:
         concepts_sorted = sorted(concepts)
         D, idx_of = _build_distance_matrix(concept_to_path, concepts_sorted)
         tax_hash = _taxonomy_hash(concepts_sorted, concept_to_path)
-        wandb.config.update({"taxonomy_hash": tax_hash, "taxonomy_ranks": RANKS}, allow_val_change=True)
+        try:
+            # Only update W&B config if a run is active
+            if getattr(wandb, "run", None) is not None:
+                wandb.config.update({"taxonomy_hash": tax_hash, "taxonomy_ranks": RANKS}, allow_val_change=True)
+        except Exception:
+            pass
         return Taxonomy(
             concepts=concepts_sorted,
             concept_to_path=concept_to_path,
