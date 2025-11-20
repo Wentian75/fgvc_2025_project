@@ -102,16 +102,25 @@ def run_infer(args):
                     preds_names.append(chosen if chosen is not None else idx2label[s_idx])
             idx += logits.size(0)
 
-    # write submission
+    # Build annotation ids and deduplicate to ensure one row per annotation_id
+    ann_ids = [parse_annotation_id_from_roi_path(rp) for rp in roi_paths]
+    unique_rows = []
+    seen = set()
+    for ann, cname in zip(ann_ids, preds_names):
+        if ann in seen:
+            continue
+        seen.add(ann)
+        unique_rows.append((ann, cname))
+
+    # write submission (unique annotation_ids only)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["annotation_id", "concept_name"])
-        for rp, cname in zip(roi_paths, preds_names):
-            ann_id = parse_annotation_id_from_roi_path(rp)
-            writer.writerow([ann_id, cname])
-    print(f"Saved submission: {out_path}")
+        for ann, cname in unique_rows:
+            writer.writerow([ann, cname])
+    print(f"Saved submission: {out_path} (rows: {len(unique_rows)})")
 
 
 def parse_args():
