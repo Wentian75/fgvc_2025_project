@@ -25,6 +25,7 @@ from .taxonomy_wandb_utils import (
     log_grouped_confusion,
     build_error_table,
     log_lora_grads,
+    align_distance_matrix_for_labels,
 )
 from .utils import save_checkpoint, save_labels, get_device
 
@@ -65,6 +66,11 @@ def run_train(args):
 
     # Taxonomy init (optional, uses WoRMS REST; cached)
     tax = init_taxonomy(idx2label, cache_dir=Path(args.cache_dir)) if args.enable_taxonomy else None
+    # Precompute distance matrix aligned to our class order (for hierarchical loss)
+    dist_mat_torch = None
+    if tax is not None and args.hd_loss_weight > 0:
+        D_np = align_distance_matrix_for_labels(tax, idx2label)
+        dist_mat_torch = torch.tensor(D_np, dtype=torch.float32)
 
     device = get_device()
     # CUDA/A100 performance knobs
@@ -88,6 +94,8 @@ def run_train(args):
 
     optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
+    if dist_mat_torch is not None:
+        dist_mat_torch = dist_mat_torch.to(device, non_blocking=True)
 
     # AMP setup (A100-friendly)
     use_amp = device.type == "cuda" and args.amp_dtype.lower() != "none"
@@ -124,7 +132,16 @@ def run_train(args):
             if use_amp:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits = model(xb)
-                    loss = criterion(logits, yb)
+                    ce = criterion(logits, yb)
+                    if dist_mat_torch is not None and args.hd_loss_weight > 0:
+                        # Expected hierarchical distance under predicted distribution
+                        D_dev = dist_mat_torch.to(device, non_blocking=True)
+                        probs = F.softmax(logits, dim=-1).float()
+                        row = D_dev[yb]  # [B, C]
+                        hd = (probs * row).sum(dim=-1).mean()
+                        loss = args.ce_loss_weight * ce + args.hd_loss_weight * hd
+                    else:
+                        loss = ce
                 if scaler and scaler.is_enabled():
                     # Unscale for consistent grad norm logging
                     scaler.scale(loss).backward()
@@ -140,7 +157,15 @@ def run_train(args):
                     optimizer.step()
             else:
                 logits = model(xb)
-                loss = criterion(logits, yb)
+                ce = criterion(logits, yb)
+                if dist_mat_torch is not None and args.hd_loss_weight > 0:
+                    D_dev = dist_mat_torch.to(device, non_blocking=True)
+                    probs = F.softmax(logits, dim=-1).float()
+                    row = D_dev[yb]
+                    hd = (probs * row).sum(dim=-1).mean()
+                    loss = args.ce_loss_weight * ce + args.hd_loss_weight * hd
+                else:
+                    loss = ce
                 loss.backward()
                 if args.use_lora:
                     log_lora_grads(model, step=global_step, prefix="lora/")
@@ -209,6 +234,8 @@ def run_train(args):
         }
         if mhd is not None and mhd == mhd:  # check for NaN
             log_data["val/mean_hierarchical_distance"] = float(mhd)
+        # Optional: log separate heads
+        # Note: train CE/HD components were combined; expose combined only to keep UI tidy
         wandb.log(log_data)
 
         # Grouped confusion
@@ -235,9 +262,20 @@ def run_train(args):
         except Exception as e:
             print(f"[val] error table skipped: {e}")
 
-        # Save best by val accuracy (simple criterion)
-        if val_acc > best_val:
-            best_val = val_acc
+        # Save best: prefer lowest MHD if available, else highest accuracy
+        save_best = False
+        if mhd is not None and mhd == mhd:
+            if not hasattr(run_train, "_best_mhd"):
+                run_train._best_mhd = mhd
+                save_best = True
+            elif mhd < run_train._best_mhd:
+                run_train._best_mhd = mhd
+                save_best = True
+        else:
+            if val_acc > best_val:
+                best_val = val_acc
+                save_best = True
+        if save_best:
             save_checkpoint(model, best_ckpt_path)
 
 
@@ -266,6 +304,8 @@ def parse_args():
     p.add_argument("--out-dir", type=str, default="outputs", help="Directory to store checkpoints and logs")
     p.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["none", "float16", "bfloat16"], help="AMP dtype for CUDA; A100 supports bfloat16 well")
     p.add_argument("--compile", action="store_true", help="Use torch.compile on CUDA for potential speedups")
+    p.add_argument("--ce-loss-weight", type=float, default=1.0, help="Weight for cross-entropy loss")
+    p.add_argument("--hd-loss-weight", type=float, default=1.0, help="Weight for expected hierarchical distance loss")
     return p.parse_args()
 
 

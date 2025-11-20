@@ -43,9 +43,10 @@ Taxonomy Resolution
 Files
 - `src/datasets.py`: CSV ROI dataset with deterministic splits and label indexing.
 - `src/model.py`: timm backbone and optional LoRA adapters.
-- `src/taxonomy_wandb_utils.py`: taxonomy resolver, MHD computation, grouped confusion, error table, LoRA grad logging.
+- `src/taxonomy_wandb_utils.py`: taxonomy resolver, MHD computation, grouped confusion, error table, LoRA grad logging, rank groups and distance alignment.
 - `src/train.py`: training loop with WandB integration.
 - `src/eval.py`: standalone evaluation/visualization over a split.
+- `src/infer.py`: Kaggle submission generation, supports hierarchical backoff predictions by rank thresholds.
 
 Notes
 - The official hierarchical scoring uses the FathomNet WoRMS module. This scaffold mirrors that logic by resolving taxonomy and computing path distance via Lowest Common Ancestor. Exact parity depends on the external service and naming normalization.
@@ -66,3 +67,12 @@ CUDA/A100 Tips
   - `torch.backends.cuda.matmul.allow_tf32 = True`
   - `torch.set_float32_matmul_precision('high')`
   - Mixed precision: `torch.autocast(device_type='cuda', dtype=torch.bfloat16)` during forward on CUDA
+
+Hierarchical Training + Inference
+- Loss targets MHD explicitly via expected hierarchical distance: total loss = `ce_loss_weight * CE + hd_loss_weight * E[D(y, \hat{y})]`.
+- Enable taxonomy for training to activate HD loss: `--enable-taxonomy --hd-loss-weight 1.0` (falls back to CE if taxonomy unavailable).
+- Save-best uses lowest validation MHD when available, otherwise accuracy.
+- Hierarchical backoff predictions for submissions (when uncertain):
+  - Enable with `src.infer --hierarchical --enable-taxonomy`.
+  - Thresholds per rank via `--rank-thresholds`, default `species:0.55,genus:0.60,family:0.65,order:0.70,class:0.75,phylum:0.80,kingdom:0.85`.
+  - If species top-1 prob < threshold, it backs off progressively to higher ranks and outputs the ancestor name.

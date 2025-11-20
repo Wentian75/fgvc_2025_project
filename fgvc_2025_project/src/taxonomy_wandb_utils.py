@@ -199,6 +199,44 @@ def init_taxonomy(concepts: List[str], cache_dir: Path) -> Optional[Taxonomy]:
         return None
 
 
+def align_distance_matrix_for_labels(tax: Taxonomy, idx2label: List[str]) -> np.ndarray:
+    """
+    Produce a distance matrix aligned to the local class index order.
+    Shape: [C, C], where C = len(idx2label) and entry (i,j) is the taxonomy distance between idx2label[i] and idx2label[j].
+    """
+    C = len(idx2label)
+    D = np.zeros((C, C), dtype=np.float32)
+    for i, ni in enumerate(idx2label):
+        ii = tax.index_of.get(ni, None)
+        for j, nj in enumerate(idx2label):
+            jj = tax.index_of.get(nj, None)
+            if ii is None or jj is None:
+                D[i, j] = 12.0  # worst case
+            else:
+                D[i, j] = float(tax.distance_matrix[ii, jj])
+    return D
+
+
+def build_rank_groups_for_labels(tax: Taxonomy, idx2label: List[str], rank: str) -> Dict[str, List[int]]:
+    """
+    Map each group name at a given rank to the list of local class indices (leaf classes) belonging to it.
+    Example: rank='phylum' -> {'Cnidaria': [3, 7, 12, ...], 'Mollusca': [...], ...}
+    """
+    rank = rank.lower()
+    if rank not in RANKS:
+        raise ValueError(f"rank must be one of {RANKS}")
+    idx = RANKS.index(rank)
+    groups: Dict[str, List[int]] = {}
+    for i, name in enumerate(idx2label):
+        path = tax.concept_to_path.get(name, [None] * 7)
+        key = path[idx] if idx < len(path) else None
+        if key is None:
+            # skip unknown
+            continue
+        groups.setdefault(key, []).append(i)
+    return groups
+
+
 def compute_mhd(labels: List[int], preds: List[int], idx2label: List[str], tax: Taxonomy) -> float:
     labels = np.asarray(labels)
     preds = np.asarray(preds)
