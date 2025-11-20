@@ -34,11 +34,21 @@ def save_checkpoint(model: torch.nn.Module, path: Path):
     torch.save(model.state_dict(), path)
 
 
-def load_checkpoint(model: torch.nn.Module, path: Path, map_location=None):
+def load_checkpoint(model: torch.nn.Module, path: Path, map_location=None, strict: bool = True):
     state = torch.load(path, map_location=map_location)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
-    model.load_state_dict(state, strict=True)
+
+    # Handle common wrappers: torch.compile (_orig_mod.) and DataParallel (module.)
+    def strip_prefixes(sd: dict) -> dict:
+        prefixes = ["_orig_mod.", "module."]
+        for pref in prefixes:
+            if any(k.startswith(pref) for k in sd.keys()):
+                sd = { (k[len(pref):] if k.startswith(pref) else k): v for k, v in sd.items() }
+        return sd
+
+    state = strip_prefixes(state)
+    model.load_state_dict(state, strict=strict)
     return model
 
 

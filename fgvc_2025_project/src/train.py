@@ -357,9 +357,15 @@ def run_train(args):
                 save_best = True
                 improved = True
         if save_best:
-            # Save in a forward-compatible wrapper
+            # Save in a forward-compatible wrapper (unwrap torch.compile/_orig_mod if present)
             best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"state_dict": model.state_dict()}, best_ckpt_path)
+            to_save = model
+            try:
+                if hasattr(model, "_orig_mod") and model._orig_mod is not None:
+                    to_save = model._orig_mod
+            except Exception:
+                pass
+            torch.save({"state_dict": to_save.state_dict()}, best_ckpt_path)
 
         # Early stopping check
         if args.early_stop:
