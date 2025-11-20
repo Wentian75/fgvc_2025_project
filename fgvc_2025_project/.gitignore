@@ -17,6 +17,7 @@ env/
 .vscode/
 .idea/
 .DS_Store
+AGENTS.md
 
 # Data and artifacts
 data/
